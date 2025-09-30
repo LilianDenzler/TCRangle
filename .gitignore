@@ -7,6 +7,7 @@ output_trangle/
 trangle.egg-info/
 20250626_0335226_summary.tsv
 trangle/nohup.out
+trangle/__pycache__/
 # Ignore temporary files
 *.tmp
 *.log
