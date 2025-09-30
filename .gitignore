@@ -1,14 +1,14 @@
 # Ignore visualization outputs
-raw/
-imgt/
-imgt_variable/
+/raw/
+/imgt/
+/imgt_variable/
 /examples/outputs/
-output_trangle/
-trangle.egg-info/
-20250626_0335226_summary.tsv
+/output_trangle/
+/trangle.egg-info/
+/20250626_0335226_summary.tsv
 /trangle/nohup.out
 /trangle/__pycache__/
-compare_stcrdb.ipynb
+/compare_stcrdb.ipynb
 # Ignore temporary files
 *.tmp
 *.log
