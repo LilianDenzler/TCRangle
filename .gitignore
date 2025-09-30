@@ -6,7 +6,7 @@ examples/outputs/
 output_trangle/
 trangle.egg-info/
 20250626_0335226_summary.tsv
-
+trangle/nohup.out
 # Ignore temporary files
 *.tmp
 *.log
