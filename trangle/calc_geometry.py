@@ -359,7 +359,7 @@ cmd.quit()
 # -------------------------
 # Public API (similar to your previous run() signature)
 # -------------------------
-def run(input_pdb, out_path, data_path=data_path, vis=True):
+def run(input_pdb, out_path, data_path, vis=True):
     """
     data_path should contain:
       - chain_A/average_structure_with_pca.pdb   (has CEN/PC1/PC2 in chain Z)
