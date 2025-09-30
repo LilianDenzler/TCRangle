@@ -1,6 +1,6 @@
 import os
 from Bio.PDB import PDBParser, Residue
-from .number import write_renumbered_fv
+from .number_old import write_renumbered_fv
 # --- Configuration: IMGT Anchor Residue Numbers ---
 # These are the conserved residues that flank the CDR loops in an IMGT-numbered structure.
 IMGT_ANCHORS = {

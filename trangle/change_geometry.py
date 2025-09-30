@@ -1,179 +1,166 @@
-import math, json
-import numpy as np
-from Bio.PDB import PDBParser, PDBIO, Superimposer
-from pathlib import Path
-from .SCRIPT_VIS_GEO import write_pseudo_pdb, generate_pymol_script
-from collections import namedtuple
-from .number import write_renumbered_fv
 import os
-# ========================
-# Helpers
-# ========================
+import numpy as np
+import warnings
+from pathlib import Path
+import math
+import json
+import tempfile
+import biotite.structure as bts
+import biotite.structure.io as btsio
+from trangle.anarci_numbering import variable_renumber
+# Suppress PDB parsing warnings for cleaner output
+warnings.filterwarnings("ignore", ".*is discontinuous.*")
+#get folder of current file
+Trangle_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"data","consensus_output")
+out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"output")
 
-Points = namedtuple("Points", ["C", "V1", "V2"])
+
+def write_renumbered_fv(out_path, in_path):
+    imgt_pdb = os.path.join(out_path)
+    variable_pdb_imgt = os.path.join(out_path.replace(".pdb", "_fv.pdb"))
+    A_chain, B_chain, imgt_path=variable_renumber(in_path, imgt_pdb, variable_pdb_imgt)
+    return out_path
+
+# ========================
+# Geometry and Math Helpers
+# ========================
 
 def normalize(v):
-    return v / np.linalg.norm(v)
-
-def rotation_matrix(axis, angle_deg):
-    axis = normalize(axis)
-    theta = math.radians(angle_deg)
-    c, s = math.cos(theta), math.sin(theta)
-    x, y, z = axis
-    C = 1 - c
-    return np.array([
-        [c+x*x*C, x*y*C-z*s, x*z*C+y*s],
-        [y*x*C+z*s, c+y*y*C, y*z*C-x*s],
-        [z*x*C-y*s, z*y*C+x*s, c+z*z*C]
-    ])
-
-def resolve_plane(a1_deg, a2_deg):
-    a1 = math.radians(a1_deg)
-    a2 = math.radians(a2_deg)
-    v1 = np.array([math.cos(a1), math.sin(a1), 0.0])
-    v2 = np.array([math.cos(a2), 0.0, math.sin(a2)])
-    return normalize(v1), normalize(v2)
-
+    """Normalizes a vector to unit length."""
+    norm = np.linalg.norm(v)
+    return v / norm if norm > 0 else v
 
 def build_geometry_from_angles(BA, BC1, BC2, AC1, AC2, dc):
-    ba_rad = np.radians(BA)
-    bc1_rad, bc2_rad = np.radians(BC1), np.radians(BC2)
-    ac1_rad, ac2_rad = np.radians(AC1), np.radians(AC2)
+    """
+    Constructs a 3D coordinate system for two domains (A and B)
+    based on 6 geometric parameters.
+    """
+    # Convert degrees to radians
+    ba_rad, bc1_rad, bc2_rad = np.radians([BA, BC1, BC2])
+    ac1_rad, ac2_rad = np.radians([AC1, AC2])
 
-    # --- 1. Set up the Foundation ---
-    B_centroid = np.array([0.0, 0.0, 0.0])
-    A_centroid = np.array([dc, 0.0, 0.0])
-    # The normalized inter-centroid vector is the x-axis
-    inter_vec_norm = np.array([1.0, 0.0, 0.0])
+    # --- Define coordinates in a local frame for Domain B ---
+    B_C = np.array([0.0, 0.0, 0.0])
+    B_V1_dir = np.array([np.cos(bc1_rad), np.sin(bc1_rad), 0.0])
 
-    # --- 2. Construct B-Domain Axes ---
-    # B1 is placed in the xy-plane at angle BC1 to the x-axis
-    B1 = np.array([np.cos(bc1_rad), np.sin(bc1_rad), 0.0])
-
-    # B2 must be perpendicular to B1 and at angle BC2 to the x-axis
-    # We solve the system of equations: B2.x = cos(BC2) and B2 . B1 = 0
     b2_x = np.cos(bc2_rad)
-    # sin(bc1) can't be zero, otherwise B1 is on x-axis and B2 can't be perp to it
-    if np.isclose(np.sin(bc1_rad), 0):
-        raise ValueError("BC1 cannot be 0 or 180 degrees.")
-    b2_y = -b2_x * np.cos(bc1_rad) / np.sin(bc1_rad)
+    b2_y = -(b2_x * np.cos(bc1_rad)) / np.sin(bc1_rad)
+    b2_z_sq = 1 - b2_x**2 - b2_y**2
+    if b2_z_sq < -1e-6: raise ValueError("BC1/BC2 angles are not geometrically compatible.")
+    B_V2_dir = normalize(np.array([b2_x, b2_y, np.sqrt(max(0, b2_z_sq))]))
 
-    radicand_b2_z = 1.0 - b2_x**2 - b2_y**2
-    if radicand_b2_z < 0:
-        raise ValueError("BC1 and BC2 angles are not geometrically compatible.")
-    # Choose positive root for the Z component for one solution
-    b2_z = np.sqrt(radicand_b2_z)
-    B2 = np.array([b2_x, b2_y, b2_z])
-    B2 = B2 / np.linalg.norm(B2) # Normalize to be safe
-
-    # --- 3. Construct A-Domain Axes ---
-    # A1 is on a cone around the x-axis, rotated by the torsion angle BA
-    A1 = np.array([
+    # --- Define coordinates for Domain A ---
+    A_C = np.array([dc, 0.0, 0.0])
+    A_V1_dir = np.array([
         -np.cos(ac1_rad),
         np.sin(ac1_rad) * np.cos(ba_rad),
         np.sin(ac1_rad) * np.sin(ba_rad)
     ])
 
-    # A2 construction follows the same logic as B2 construction
     a2_x = -np.cos(ac2_rad)
+    c1 = -A_V1_dir[0] * a2_x
+    r_sq = 1.0 - a2_x**2
+    y1, z1 = A_V1_dir[1], A_V1_dir[2]
 
-    # We solve the system A2 . A1 = 0 and |A2|=1 for the other components
-    # This is a robust way to solve for the remaining y and z components
-    v_perp = np.array([-A1[1], A1[0], 0])
-    if np.linalg.norm(v_perp) < 1e-6:
-        v_perp = np.array([-A1[2], 0, A1[0]])
-    v_perp = v_perp / np.linalg.norm(v_perp)
-    v_perp2 = np.cross(A1, v_perp)
+    # Handle the case where y1 is close to zero to avoid division errors
+    if np.isclose(y1, 0):
+        if np.isclose(z1, 0): raise ValueError("A_V1_dir cannot be parallel to the center axis.")
+        a2_z = c1 / z1
+        rad_y_sq = r_sq - a2_z**2
+        if rad_y_sq < -1e-6: raise ValueError("AC1/AC2 angles are not geometrically compatible.")
+        a2_y = np.sqrt(max(0, rad_y_sq))
+    else:
+        qa = z1**2 + y1**2
+        qb = -2 * c1 * z1
+        qc = c1**2 - r_sq * y1**2
+        rad_quad = qb**2 - 4 * qa * qc
+        if rad_quad < -1e-6: raise ValueError("AC1/AC2 angles are not geometrically compatible.")
 
-    # Solve a 2x2 system for coefficients c1, c2
-    # A2 = a2_x*A1 + c1*v_perp + c2*v_perp2 doesn't work.
-    # We must solve for y and z directly given A2.x and A2.A1=0
-    # A1_x*a2_x + A1_y*a2_y + A1_z*a2_z = 0
-    # a2_x^2 + a2_y^2 + a2_z^2 = 1
+        a2_z = (-qb + np.sqrt(max(0, rad_quad))) / (2 * qa)
+        a2_y = (c1 - z1 * a2_z) / y1
 
-    # Simplified solution:
-    v1 = np.cross(np.array([-1.0, 0, 0]), A1) # Vector in plane perp to A1
-    v2 = np.cross(A1, v1)
-    v1_norm = v1 / np.linalg.norm(v1)
-    v2_norm = v2 / np.linalg.norm(v2)
+    A_V2_dir = normalize(np.array([a2_x, a2_y, a2_z]))
 
-    # Solve A2 = a*v1_norm + b*v2_norm
-    b_coeff = (a2_x - np.dot(np.array([-1.0, 0, 0]), v2_norm) * np.dot(v2_norm, A1)) / np.dot(np.array([-1.0, 0, 0]), v2_norm)
-    # Given A1 = (x1, y1, z1) and A2 = (x2, y2, z2) where x2 is known.
-    # y1*y2 + z1*z2 = -x1*x2
-    # y2^2 + z2^2 = 1 - x2^2
-    # This is solving for an intersection of a line and circle in the yz plane.
-    y1_p = A1[1]
-    z1_p = A1[2]
-    c1 = -A1[0] * a2_x # Constant term
-    r_sq = 1 - a2_x**2   # Radius squared of the circle
-
-    # Substitute y2 = (c1 - z1_p*z2) / y1_p into circle equation
-    if abs(y1_p) > 1e-6:
-        # Quadratic equation for z2: (z1_p^2 + y1_p^2) * z2^2 - 2*c1*z1_p*z2 + (c1^2 - r_sq*y1_p^2) = 0
-        qa = z1_p**2 + y1_p**2
-        qb = -2 * c1 * z1_p
-        qc = c1**2 - r_sq * y1_p**2
-
-        radicand_quad = qb**2 - 4 * qa * qc
-        if radicand_quad < 0: raise ValueError("AC1/AC2 angles incompatible")
-
-        a2_z = (-qb + np.sqrt(radicand_quad)) / (2 * qa)
-        a2_y = (c1 - z1_p * a2_z) / y1_p
-    else: # Case where A1 is in xz plane
-        a2_z = c1 / z1_p
-        radicand_y = r_sq - a2_z**2
-        if radicand_y < 0: raise ValueError("AC1/AC2 angles incompatible")
-        a2_y = np.sqrt(radicand_y)
-
-    A2 = np.array([a2_x, a2_y, a2_z])
-    A2 = A2 / np.linalg.norm(A2)
-
-    return (A_centroid, A1, A2,B_centroid, B1,B2)
+    return (A_C, A_C + A_V1_dir, A_C + A_V2_dir, B_C, B_C + B_V1_dir, B_C + B_V2_dir)
 
 
+def apply_transformation(coords, R, t):
+    """Applies rotation (R) and translation (t) to a set of coordinates."""
+    return (coords @ R.T) + t
 
+def change_geometry(cons_pdb_with_pca, chain_id, target_centroid, target_v1, target_v2):
+    """
+    Moves a consensus chain structure to a new target geometry by reading its
+    source geometry from pseudoatoms.
+    """
+    structure = btsio.load_structure(cons_pdb_with_pca, model=1)
+    chain = structure[structure.chain_id == chain_id]
 
-def load_structure(path):
-    return PDBParser(QUIET=True).get_structure("s", path)
+    # 1. Determine the source geometry from pseudoatoms in the same file
+    try:
+        source_centroid = structure[(structure.res_name == 'CEN') & (structure.chain_id == 'Z')].coord[0]
+        source_v1_end = structure[(structure.res_name == 'PC1') & (structure.chain_id == 'Z')].coord[0]
+        source_v2_end = structure[(structure.res_name == 'PC2') & (structure.chain_id == 'Z')].coord[0]
+        source_v1_dir = normalize(source_v1_end - source_centroid)
+        source_v2_dir = normalize(source_v2_end - source_centroid)
+    except IndexError:
+        raise ValueError(f"Could not find CEN, PC1, PC2 pseudoatoms in {cons_pdb_with_pca}")
 
-def transform_chain(chain, R, t):
-    for atom in chain.get_atoms():
-        atom.coord = (R @ atom.coord) + t
+    # 2. Define the target geometry vectors relative to the centroid
+    target_v1_dir = normalize(target_v1 - target_centroid)
+    target_v2_dir = normalize(target_v2 - target_centroid)
 
-def principal_axes(chain):
-    cas = np.array([a.coord for a in chain.get_atoms() if a.get_name() == "CA"])
-    cas -= cas.mean(axis=0)
-    cov = np.cov(cas.T)
-    vals, vecs = np.linalg.eigh(cov)
-    order = np.argsort(vals)[::-1]
-    return normalize(vecs[:,order[0]]), normalize(vecs[:,order[1]])
+    # 3. Calculate transformation
+    R_source = np.stack([source_v1_dir, source_v2_dir, np.cross(source_v1_dir, source_v2_dir)], axis=1)
+    R_target = np.stack([target_v1_dir, target_v2_dir, np.cross(target_v1_dir, target_v2_dir)], axis=1)
+    rotation = R_target @ np.linalg.inv(R_source)
 
-def centroid_and_vectors(structure, chain, pcs, coresets):
-    ca_coords = [
-        atom.get_coord() for atom in structure.get_atoms()
-        if atom.get_name() == "CA"
-        and atom.parent.parent.id == chain
-        and atom.parent.id[1] in coresets[chain]
-    ]
-    centroid = np.mean(ca_coords, axis=0)
-    coefs, *_ = np.linalg.lstsq(pcs.T, centroid, rcond=None)
-    C = coefs @ pcs
-    return Points(C=C, V1=C + pcs[0], V2=C + pcs[1])
+    # 4. Apply transformation to the entire chain
+    chain.coord = apply_transformation(chain.coord, np.identity(3), -source_centroid) # Move to origin
+    chain.coord = apply_transformation(chain.coord, rotation, np.zeros(3))           # Rotate
+    chain.coord = apply_transformation(chain.coord, np.identity(3), target_centroid)  # Move to target
 
-def get_coreset_atoms(structure, chain_id, coresets):
-    return [
-        atom for atom in structure.get_atoms()
-        if atom.get_name() == "CA"
-        and atom.parent.parent.id == chain_id
-        and atom.parent.id[1] in coresets[chain_id]
-    ]
+    return chain
 
+def move_chains_to_geometry(new_consensus_pdb, input_pdb, output_pdb,A_consenus_res, B_consenus_res):
+    """
+    Aligns the chains of an input PDB to the newly generated consensus geometry.
+    """
+    aligned_chain_A = align_chain_to_consensus(input_pdb, new_consensus_pdb, "A", static_consenus_res=A_consenus_res, mobile_consenus_res=A_consenus_res)
+    aligned_chain_B = align_chain_to_consensus(input_pdb, new_consensus_pdb, "B", static_consenus_res=B_consenus_res, mobile_consenus_res=B_consenus_res)
 
-# -------------------------------------------------------
-# PyMOL visualisation
-# -------------------------------------------------------
-def add_cgo_arrow(start,end,color,radius=0.3):
+    final_aligned_structure = aligned_chain_A + aligned_chain_B
+    btsio.save_structure(output_pdb, final_aligned_structure)
+    print(f"Saved final aligned structure to: {output_pdb}")
+
+def align_chain_to_consensus(mobile_pdb_path, static_pdb_path, chain_id, mobile_consenus_res=None, static_consenus_res=None):
+    """Helper to align a single chain and return the transformed AtomArray."""
+    static_struct = btsio.load_structure(static_pdb_path, model=1)
+    mobile_struct = btsio.load_structure(mobile_pdb_path, model=1)
+    static_ca = static_struct[(static_struct.atom_name == "CA") & (static_struct.chain_id == chain_id)]
+    mobile_ca = mobile_struct[(mobile_struct.atom_name == "CA") & (mobile_struct.chain_id == chain_id)]
+    if static_consenus_res:
+        static_ca = static_ca[np.isin(static_ca.res_id, static_consenus_res)]
+    if mobile_consenus_res:
+        mobile_ca = mobile_ca[np.isin(mobile_ca.res_id, mobile_consenus_res)]
+    if static_ca.array_length() < 4 or mobile_ca.array_length() < 4:
+        raise ValueError(f"Not enough C-alpha atoms for alignment on chain {chain_id}")
+
+    _, transform, _, _ = bts.superimpose_structural_homologs(fixed=static_ca, mobile=mobile_ca)
+
+    mobile_chain_full = mobile_struct[mobile_struct.chain_id == chain_id]
+
+    # Apply transformation using a robust matrix operation
+    M = np.asarray(transform.as_matrix(), dtype=np.float64)[0]
+    R, t = M[:3, :3], M[:3, 3]
+    mobile_chain_full.coord = (mobile_chain_full.coord @ R.T) + t
+
+    return mobile_chain_full
+
+def add_cgo_arrow(start, end, color, radius=0.3):
+    """Generates a CGO string for a PyMOL arrow object."""
+    # This function is unchanged but included for completeness
     return f"""[
         cgo.CYLINDER,{start[0]:.3f},{start[1]:.3f},{start[2]:.3f},
                      {end[0]:.3f},{end[1]:.3f},{end[2]:.3f},
@@ -187,288 +174,194 @@ def add_cgo_arrow(start,end,color,radius=0.3):
                  {color[0]},{color[1]},{color[2]},1.0
     ]"""
 
+def generate_pymol_script(aligned_pdb, new_consensus_pdb, A_C, A_V1, A_V2, B_C, B_V1, B_V2, out_prefix, vis_folder):
+    """
+    Generates a PyMOL script to visualize the final alignment with longer PCA
+    axes and visible centroids.
+    """
+    pdb_name = Path(aligned_pdb).stem
 
-def generate_pymol_script2(input_pdb, cons_pdb, A_C, A_V1, A_V2, B_C, B_V1, B_V2, out_prefix, vis_folder):
-    pdb_name = Path(input_pdb).stem
+    # --- FIX: Increased scale factor for longer PCA axes ---
     scale = 10.0
-    a1 = A_C + scale * (A_V1 - A_C)
-    a2 = A_C + scale * (A_V2 - A_C)
-    b1 = B_C + scale * (B_V1 - B_C)
-    b2 = B_C + scale * (B_V2 - B_C)
+
+    # Calculate endpoints for the CGO arrows
+    a1_end = A_C + scale * (A_V1 - A_C)
+    a2_end = A_C + scale * (A_V2 - A_C)
+    b1_end = B_C + scale * (B_V1 - B_C)
+    b2_end = B_C + scale * (B_V2 - B_C)
 
     script = f"""
+import numpy as np
 from pymol import cmd, cgo
-cmd.load("{input_pdb}","input_{pdb_name}")
-cmd.load("{cons_pdb}","cons_{pdb_name}")
+cmd.load("{aligned_pdb}","aligned_{pdb_name}")
+cmd.load("{new_consensus_pdb}","consensus_geom")
 cmd.bg_color("white")
 cmd.hide("everything","all")
-cmd.show("cartoon","input_{pdb_name}")
-cmd.color("blue","input_{pdb_name} and chain A")
-cmd.color("green","input_{pdb_name} and chain B")
-cmd.set("cartoon_transparency",0.5,"input_{pdb_name}")
-cmd.show("cartoon","cons_{pdb_name}")
-cmd.color("magenta","cons_{pdb_name}")
 
-cmd.pseudoatom("CAcent_{pdb_name}", pos={list(A_C)}, color="red")
-cmd.pseudoatom("CBcent_{pdb_name}", pos={list(B_C)}, color="red")
-cmd.show("spheres","CAcent_{pdb_name} or CBcent_{pdb_name}")
-cmd.set("sphere_scale",1.0,"CAcent_{pdb_name} or CBcent_{pdb_name}")
+cmd.show("cartoon","aligned_{pdb_name}")
+# --- FIX: Using standard PyMOL color names ---
+cmd.color("marine","aligned_{pdb_name} and chain A")
+cmd.color("teal","aligned_{pdb_name} and chain B")
 
-cmd.pseudoatom("A1end_{pdb_name}", pos={list(a1)})
-cmd.pseudoatom("A2end_{pdb_name}", pos={list(a2)})
-cmd.pseudoatom("B1end_{pdb_name}", pos={list(b1)})
-cmd.pseudoatom("B2end_{pdb_name}", pos={list(b2)})
+cmd.show("cartoon","consensus_geom and polymer")
+# --- FIX: Using a more standard gray color ---
+cmd.color("gray","consensus_geom")
+cmd.set("cartoon_transparency", 0.5, "consensus_geom and polymer")
 
-cmd.load_cgo({add_cgo_arrow(A_C,a1,(0.2,0.5,1.0))},"PC1A_{pdb_name}")
-cmd.load_cgo({add_cgo_arrow(A_C,a2,(0.1,0.8,0.1))},"PC2A_{pdb_name}")
-cmd.load_cgo({add_cgo_arrow(B_C,b1,(0.2,0.5,1.0))},"PC1B_{pdb_name}")
-cmd.load_cgo({add_cgo_arrow(B_C,b2,(0.1,0.8,0.1))},"PC2B_{pdb_name}")
-cmd.load_cgo({add_cgo_arrow(A_C,B_C,(0.5,0.0,0.5))},"dc_{pdb_name}")
+# --- FIX: Explicitly create and show spheres for the centroids ---
+cmd.pseudoatom("centroid_A", pos={list(A_C)}, color="red")
+cmd.pseudoatom("centroid_B", pos={list(B_C)}, color="orange")
+cmd.pseudoatom("PCA_A1", pos={list(a1_end)}, color="white")
+cmd.pseudoatom("PCA_A2", pos={list(a2_end)}, color="white")
+cmd.pseudoatom("PCA_B1", pos={list(b1_end)}, color="white")
+cmd.pseudoatom("PCA_B2", pos={list(b2_end)}, color="white")
+cmd.show("spheres", "centroid_A or centroid_B or PCA_A1 or PCA_A2 or PCA_B1 or PCA_B2")
+cmd.set("sphere_scale", 0.5, "centroid_A or centroid_B or PCA_A1 or PCA_A2 or PCA_B1 or PCA_B2")
 
-cmd.angle("AC1_{pdb_name}","A1end_{pdb_name}","CAcent_{pdb_name}","CBcent_{pdb_name}")
-cmd.angle("AC2_{pdb_name}","A2end_{pdb_name}","CAcent_{pdb_name}","CBcent_{pdb_name}")
-cmd.angle("BC1_{pdb_name}","B1end_{pdb_name}","CBcent_{pdb_name}","CAcent_{pdb_name}")
-cmd.angle("BC2_{pdb_name}","B2end_{pdb_name}","CBcent_{pdb_name}","CAcent_{pdb_name}")
-cmd.distance("dc_{pdb_name}","CAcent_{pdb_name}","CBcent_{pdb_name}")
+# Load CGO arrows representing the scaled PCA axes
+cmd.load_cgo({add_cgo_arrow(A_C, a1_end, (0.2, 0.5, 1.0))}, "PC1_A")
+cmd.load_cgo({add_cgo_arrow(A_C, a2_end, (0.1, 0.8, 0.1))}, "PC2_A")
+cmd.load_cgo({add_cgo_arrow(B_C, b1_end, (1.0, 0.5, 0.2))}, "PC1_B")
+cmd.load_cgo({add_cgo_arrow(B_C, b2_end, (0.8, 0.8, 0.1))}, "PC2_B")
+cmd.load_cgo({add_cgo_arrow(A_C, B_C, (0.5,0.0,0.5))},"dc")
 
-cmd.zoom("all")
-cmd.png("{os.path.join(vis_folder,out_prefix+"_vis.png")}", dpi=300)
-cmd.save("{os.path.join(vis_folder,out_prefix+"_vis.pse")}")
+
+# --- measurements (wizard-equivalent) ---
+cmd.distance("dc_len", "centroid_B", "centroid_A")                 # distance dc
+cmd.angle("BC1_ang", "PCA_B1", "centroid_B", "centroid_A")         # angle BC1
+cmd.angle("BC2_ang", "PCA_B2", "centroid_B", "centroid_A")         # angle BC2
+cmd.angle("AC1_ang", "PCA_A1", "centroid_A", "centroid_B")         # angle AC1
+cmd.angle("AC2_ang", "PCA_A2", "centroid_A", "centroid_B")         # angle AC2
+cmd.dihedral("BA_dih", "PCA_B1", "centroid_B", "centroid_A", "PCA_A1")  # dihedral BA
+
+# Ensure measurement objects are visible
+cmd.enable("dc_len")
+cmd.enable("BC1_ang")
+cmd.enable("BC2_ang")
+cmd.enable("AC1_ang")
+cmd.enable("AC2_ang")
+cmd.enable("BA_dih")
+
+# Global styling for measurement dashes & labels (applies to all three)
+cmd.set("dash_width", 3.0)
+cmd.set("dash_gap", 0.0)
+cmd.set("label_size", 18)
+cmd.set("label_color", "black")
+cmd.set("label_distance_digits", 2)  # for distances
+cmd.set("label_angle_digits", 1)     # for angles/dihedrals
+
+cmd.orient()
+cmd.zoom("all", 1.2)
+cmd.png("{os.path.join(vis_folder, out_prefix + "_final_vis.png")}", dpi=300, ray=1)
+cmd.save("{os.path.join(vis_folder, out_prefix + "_final_vis.pse")}")
 cmd.quit()
 """
-    vis_script = os.path.join(vis_folder,out_prefix+"_vis.py")
-    with open(vis_script, "w") as f:
+    vis_script_path = os.path.join(vis_folder, out_prefix + "_final_vis.py")
+    with open(vis_script_path, "w") as f:
         f.write(script)
-    return os.path.join(vis_folder,out_prefix+'_vis.py')
+    return vis_script_path
 
+def run(input_pdb, out_path, BA, BC1, BC2, AC1, AC2, dc, data_path=data_path):
+    # --- Define paths to input data ---
+    consA_pca_path = os.path.join(data_path, "chain_A/average_structure_with_pca.pdb")
+    consB_pca_path = os.path.join(data_path, "chain_B/average_structure_with_pca.pdb")
+    #read file with consensus alignment residues as list of integers
+    with open(os.path.join(data_path, "chain_A/consensus_alignment_residues.txt"), "r") as f:
+        content = f.read().strip()
+    A_consenus_res = [int(x) for x in content.split(",") if x.strip()]
+    with open(os.path.join(data_path, "chain_B/consensus_alignment_residues.txt"), "r") as f:
+        content = f.read().strip()
+    B_consenus_res = [int(x) for x in content.split(",") if x.strip()]
 
-def add_centroid_pseudoatoms(structure, A_C, B_C):
-    """
-    Inject pseudoatoms (as HETATM) for visualization.
-    """
-    from Bio.PDB.Atom import Atom
-    from Bio.PDB.Residue import Residue
-    from Bio.PDB.Chain import Chain
-    from Bio.PDB.Model import Model
-    from Bio.PDB.Structure import Structure
-    import numpy as np
-
-    # Create a new structure so we can append easily
-    new_struct = Structure("consensus_with_centroids")
-    model = Model(0)
-    new_struct.add(model)
-
-    # copy over existing chains
-    for c in structure[0]:
-        model.add(c.copy())
-
-    # helper to create a pseudoatom
-    def make_pseudo_atom(name, coord):
-        return Atom(
-            name, np.array(coord, dtype=float), 1.0, 1.0, ' ', name, 999, 'C'
-        )
-
-    # put them in their own chain to avoid confusion
-    chainC = Chain("Z")  # new chain for pseudoatoms
-    resA = Residue((" ", 900, " "), "CEN", "")
-    resA.add(make_pseudo_atom("CA", A_C))
-    chainC.add(resA)
-    resB = Residue((" ", 901, " "), "CEN", "")
-    resB.add(make_pseudo_atom("CB", B_C))
-    chainC.add(resB)
-
-    model.add(chainC)
-    return new_struct
-
-
-# -------------------------------------------------------
-# main Code
-# -------------------------------------------------------
-def change_geometry(angles, out_pdb, input_pdb, consA_path, consB_path, coresets, pcsA, pcsB):
-    [BA, BC1, BC2, AC1, AC2, dc] = angles
-
-    # Synthetic geometry (target)
-    A_C,A_V1, A_V2,B_C, B_V1, B_V2=build_geometry_from_angles(BA, BC1, BC2, AC1, AC2, dc)
-    write_pseudo_pdb("geom_points.pdb", A_C,A_V1, A_V2,B_C, B_V1, B_V2)
-    generate_pymol_script("geom_points.pdb", A_C,A_V1, A_V2,B_C, B_V1, B_V2)
-    os.remove("geom_points.pdb")
-
-    # Load consensus structures
-    consA = load_structure(consA_path)
-    consB = load_structure(consB_path)
-    chainA = [c for c in consA.get_chains() if c.id == "A"][0]
-    chainB = [c for c in consB.get_chains() if c.id == "B"][0]
-
-    # ===== Chain A =====
-    Apts = centroid_and_vectors(consA, "A", pcsA, coresets)
-    A_C_src = Apts.C
-    A_V1_src = normalize(Apts.V1 - A_C_src)
-    A_V2_src = normalize(Apts.V2 - A_C_src)
-
-    # translate chain A so centroid matches A_C
-    tA = A_C - A_C_src
-    for atom in chainA.get_atoms():
-        atom.coord = atom.coord + tA
-    A_V1_t = Apts.V1 + tA
-    A_V2_t = Apts.V2 + tA
-    A_C_t  = Apts.C  + tA
-
-    # rotate so PCA basis matches synthetic
-    R_srcA = np.stack([normalize(A_V1_t - A_C_t),
-                       normalize(A_V2_t - A_C_t),
-                       np.cross(normalize(A_V1_t - A_C_t),
-                                normalize(A_V2_t - A_C_t))], axis=1)
-    R_tgtA = np.stack([A_V1, A_V2, np.cross(A_V1, A_V2)], axis=1)
-    R_alignA = R_tgtA @ R_srcA.T
-
-    for atom in chainA.get_atoms():
-        atom.coord = R_alignA @ (atom.coord - A_C) + A_C
-    A_V1_final = R_alignA @ (A_V1_t - A_C) + A_C
-    A_V2_final = R_alignA @ (A_V2_t - A_C) + A_C
-
-    # ===== Chain B =====
-    Bpts = centroid_and_vectors(consB, "B", pcsB, coresets)
-    B_C_src = Bpts.C
-    B_V1_src = normalize(Bpts.V1 - B_C_src)
-    B_V2_src = normalize(Bpts.V2 - B_C_src)
-
-    # translate chain B so centroid matches B_C
-    tB = B_C - B_C_src
-    for atom in chainB.get_atoms():
-        atom.coord = atom.coord + tB
-    B_V1_t = Bpts.V1 + tB
-    B_V2_t = Bpts.V2 + tB
-    B_C_t  = Bpts.C  + tB
-
-    # rotate so PCA basis matches synthetic
-    R_srcB = np.stack([normalize(B_V1_t - B_C_t),
-                       normalize(B_V2_t - B_C_t),
-                       np.cross(normalize(B_V1_t - B_C_t),
-                                normalize(B_V2_t - B_C_t))], axis=1)
-    R_tgtB = np.stack([B_V1, B_V2, np.cross(B_V1, B_V2)], axis=1)
-    R_alignB = R_tgtB @ R_srcB.T
-
-    for atom in chainB.get_atoms():
-        atom.coord = R_alignB @ (atom.coord - B_C) + B_C
-    B_V1_final = R_alignB @ (B_V1_t - B_C) + B_C
-    B_V2_final = R_alignB @ (B_V2_t - B_C) + B_C
-
-    # ===== Save merged PDB =====
-    consA[0].add(chainB)
-    # add pseudoatoms for centroids
-    new_struct = add_centroid_pseudoatoms(consA, A_C, B_C)
-    io = PDBIO()
-    io.set_structure(new_struct)
-    io.save(out_pdb)
-    print("Consensus structure saved to:", out_pdb)
-    return new_struct, A_C, A_V1_final, A_V2_final, B_C, B_V1_final, B_V2_final
-
-
-def apply_transform(structure, rot, tran, chain_name):
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                for atom in residue:
-                    if chain.get_id() != chain_name:
-                        continue
-                    else:
-                        atom.transform(rot, tran)
-    return structure
-
-
-def move_chains_to_geometry(new_consensus, input_pdb, output_pdb, coresets):
-    parser = PDBParser(QUIET=True)
-    input_struct = parser.get_structure("input", input_pdb)
-    # Step 1: superpose input A onto consensus A
-    si = Superimposer()
-    si.set_atoms(get_coreset_atoms(new_consensus,"A",coresets),
-                 get_coreset_atoms(input_struct,"A",coresets))
-    rotA, tranA = si.rotran
-    input_struct=apply_transform(input_struct, rotA, tranA, "A")
-
-    # Step 2: superpose consensus B onto moved input B
-    si2 = Superimposer()
-    si2.set_atoms(get_coreset_atoms(new_consensus,"B",coresets),
-                  get_coreset_atoms(input_struct,"B",coresets))
-    rotB, tranB = si2.rotran
-    input_struct=apply_transform(input_struct, rotB, tranB, "B")
-    print("Chains moved to new geometry.")
-    #save to pdb
-    io = PDBIO()
-    io.set_structure(input_struct)
-    io.save(output_pdb)
-    return output_pdb
-
-# ========================
-# Main
-# ========================
-# --- paths ---
-data_path = "/workspaces/Graphormer/TRangle/data"
-consA_path = f"{data_path}/consensus_A.pdb"
-consB_path = f"{data_path}/consensus_B.pdb"
-coresets = json.load(open(f"{data_path}/coresets.json"))
-pcsA = np.loadtxt(f"{data_path}/principal_components_alpha.csv")
-pcsB = np.loadtxt(f"{data_path}/principal_components_beta.csv")
-
-def config(config_file):
-    #read config file
-    import configparser
-    config = configparser.ConfigParser()
-    config.read(config_file)
-    global BA, BC1, BC2, AC1, AC2, dc
-    BA = config.getfloat('Angles', 'BA')
-    BC1 = config.getfloat('Angles', 'BC1')
-    BC2 = config.getfloat('Angles', 'BC2')
-    AC1 = config.getfloat('Angles', 'AC1')
-    AC2 = config.getfloat('Angles', 'AC2')
-    dc = config.getfloat('Angles', 'dc')
-    return BA, BC1, BC2, AC1, AC2, dc
-
-def run(input_pdb,out_path, BA, BC1, BC2, AC1, AC2, dc):
+    # --- Setup output directories ---
     pdb_name = Path(input_pdb).stem
-    out_dir= Path(out_path)
-    out_dir.mkdir(exist_ok=True)
-    tmp_out= out_dir/pdb_name
-    tmp_out.mkdir(exist_ok=True)
-    vis_folder = tmp_out / "vis"
-    vis_folder.mkdir(exist_ok=True)
-    write_renumbered_fv(os.path.join(tmp_out, f"{pdb_name}fv.pdb"), str(input_pdb))
-    input_pdb=os.path.join(tmp_out, f"{pdb_name}fv.pdb")
-    angles=[BA, BC1, BC2, AC1, AC2, dc]
-    new_consensus, A_Cf, A_V1f, A_V2f, B_Cf, B_V1f, B_V2f= change_geometry(angles, os.path.join(tmp_out, f"consensus_oriented.pdb") , input_pdb, consA_path, consB_path, coresets, pcsA, pcsB)
-    move_chains_to_geometry(new_consensus, input_pdb, os.path.join(tmp_out, f"{pdb_name}_oriented.pdb"), coresets)
-    vis_script=generate_pymol_script2(os.path.join(tmp_out, f"{pdb_name}_oriented.pdb"), os.path.join(tmp_out, f"consensus_oriented.pdb"), A_Cf, A_V1f, A_V2f, B_Cf, B_V1f, B_V2f, pdb_name, vis_folder)
+    out_dir = Path(out_path); out_dir.mkdir(exist_ok=True)
+    tmp_out = out_dir / pdb_name; tmp_out.mkdir(exist_ok=True)
+    vis_folder = tmp_out / "vis"; vis_folder.mkdir(exist_ok=True)
 
-    #run  pymol -cq {vis_script}
-    print(f"✅ PyMOL script saved as {vis_script}. Run with:\n   pymol -cq {vis_script}")
+    renumbered_pdb = str(tmp_out / f"{pdb_name}_imgt.pdb")
+    renumbered_pdb_fv =str(tmp_out / f"{pdb_name}_imgt_fv.pdb")
+    write_renumbered_fv(renumbered_pdb, input_pdb)
+
+    # 1. Build the target geometry from the input angles
+    A_C, A_V1, A_V2, B_C, B_V1, B_V2 = build_geometry_from_angles(BA, BC1, BC2, AC1, AC2, dc)
+
+    # 2. Move the consensus chains to this new target geometry
+    new_chain_A = change_geometry(consA_pca_path, "A", A_C, A_V1, A_V2)
+    new_chain_B = change_geometry(consB_pca_path, "B", B_C, B_V1, B_V2)
+
+    # 3. Combine the moved chains and add pseudoatoms for the new geometry
+    new_consensus_structure = new_chain_A + new_chain_B
+
+    # Create pseudoatoms for the new target geometry for validation
+    target_pseudoatoms_A = bts.array([
+        bts.Atom(coord=A_C, atom_name="CA", res_id=900, res_name="GEA", chain_id="X", element="X"),
+        bts.Atom(coord=A_V1, atom_name="V1", res_id=900, res_name="GEA", chain_id="X", element="X"),
+        bts.Atom(coord=A_V2, atom_name="V2", res_id=900, res_name="GEA", chain_id="X", element="X")
+    ])
+    target_pseudoatoms_B = bts.array([
+        bts.Atom(coord=B_C, atom_name="CB", res_id=901, res_name="GEB", chain_id="Y", element="X"),
+        bts.Atom(coord=B_V1, atom_name="V1", res_id=901, res_name="GEB", chain_id="Y", element="X"),
+        bts.Atom(coord=B_V2, atom_name="V2", res_id=901, res_name="GEB", chain_id="Y", element="X")
+    ])
+
+    structure_with_geom = new_consensus_structure + target_pseudoatoms_A + target_pseudoatoms_B
+    new_consensus_pdb = str(tmp_out / "consensus_oriented.pdb")
+    btsio.save_structure(new_consensus_pdb, structure_with_geom)
+    print(f"Saved new target geometry with pseudoatoms to: {new_consensus_pdb}")
+
+    # 4. Align the input TCR chains to the new consensus geometry
+    final_aligned_pdb = str(tmp_out / f"{pdb_name}_oriented.pdb")
+    move_chains_to_geometry(new_consensus_pdb, renumbered_pdb_fv, final_aligned_pdb, A_consenus_res, B_consenus_res)
+
+    # 5. Generate visualization script
+    vis_script = generate_pymol_script(
+        final_aligned_pdb, new_consensus_pdb,
+        A_C, A_V1, A_V2, B_C, B_V1, B_V2, pdb_name, str(vis_folder)
+    )
+
+    print(f"\n✅ PyMOL script saved. Run with:\n   pymol -cq {vis_script}")
     os.system(f"pymol -cq {vis_script}")
     print(f"Output files saved in: {tmp_out}")
-    #print angles into txt in the tmp_out folder
-    angles_file = tmp_out / "angles.txt"
-    with open(angles_file, "w") as f:
-        f.write(f"BA: {BA}\nBC1: {BC1}\nBC2: {BC2}\nAC1: {AC1}\nAC2: {AC2}\ndc: {dc}\n")
-    print(f"Angles saved to: {angles_file}")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Change TCR geometry based on angles.")
-    parser.add_argument('--config', type=str, default='config.ini', help='Path to configuration file.')
-    parser.add_argument('--input_pdb', type=str, help='Path to input PDB file.')
-    parser.add_argument('--out_path', type=str, default='output', help='Output directory for results.')
-    args = parser.parse_args()
-    if args.config:
-        config_file = args.config
-    else:
-        config_file = "config.ini"
-    if args.input_pdb:
-        input_pdb = args.input_pdb
-    else:
-        raise ValueError("Input PDB file must be specified.")
-    if args.out_path:
-        out_path = args.out_path
-    else:
-        out_path = "output"
-    BA, BC1, BC2, AC1, AC2, dc=config(config_file=config_file)
-    run(input_pdb, out_path, BA, BC1, BC2, AC1, AC2, dc)
+    parser = argparse.ArgumentParser(description="Reorient a TCR structure based on 6 geometric parameters.")
+    parser.add_argument('--input_pdb', type=str, required=True, help='Path to input PDB file.')
+    parser.add_argument('--data_path', type=str, required=False, help='Path to data directory containing consensus files.', default=data_path)
+    parser.add_argument('--out_path', type=str, required=False, help='Output directory for results.', default=out_path)
+    parser.add_argument('--BA', type=float, required=True, help='Torsion angle between PC1_A and PC1_B.')
+    parser.add_argument('--BC1', type=float, required=True, help='Bend angle between PC1_B and center axis.')
+    parser.add_argument('--BC2', type=float, required=True, help='Bend angle between PC2_B and center axis.')
+    parser.add_argument('--AC1', type=float, required=True, help='Bend angle between PC1_A and center axis.')
+    parser.add_argument('--AC2', type=float, required=True, help='Bend angle between PC2_A and center axis.')
+    parser.add_argument('--dc', type=float, required=True, help='Distance between centroids.')
 
+    args = parser.parse_args()
+
+    run(
+        input_pdb=args.input_pdb,
+        out_path=args.out_path,
+        BA=args.BA, BC1=args.BC1, BC2=args.BC2,
+        AC1=args.AC1, AC2=args.AC2, dc=args.dc,
+        data_path=args.data_path
+    )
+    """
+    BA = 113.229304
+    BC1 = 98.75194
+    BC2 = 9.350585
+    AC1 = 71.58541
+    AC2 = 154.623844
+    dc = 23.978255
+    input_pdb = "/workspaces/Graphormer/TRangle/examples/A6prmtop_first_frame_GT.pdb"
+    out_path = "output_try_change_geometry"
+    data_path = "/workspaces/Graphormer/TRangle/data/consensus_output"
+    run(
+        input_pdb=input_pdb,
+        out_path=out_path,
+        BA=BA, BC1=BC1, BC2=BC2,
+        AC1=AC1, AC2=AC2, dc=dc,
+        data_path=data_path
+    )
+    """
 

@@ -1,10 +1,15 @@
-20250626_0335226_summary.tsv
-trangle/angles_results.csv
-compare_stcrdb.ipynb
-stcrdb_results.csv
+# Ignore visualization outputs
 raw/
-imgt_variable/
 imgt/
-examples/.Prod_Concat_A6_CMD.xtc_offsets.npz
-*.xtc
+imgt_variable/
+examples/outputs/
+output_trangle/
 trangle.egg-info/
+20250626_0335226_summary.tsv
+
+# Ignore temporary files
+*.tmp
+*.log
+
+# Ignore any vis folders across the repo
+*/vis/
