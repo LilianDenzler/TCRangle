@@ -1,6 +1,6 @@
 import os
 from Bio.PDB import PDBParser, Residue
-from .number_old import write_renumbered_fv
+from trangle.numbering import process_pdb
 # --- Configuration: IMGT Anchor Residue Numbers ---
 # These are the conserved residues that flank the CDR loops in an IMGT-numbered structure.
 IMGT_ANCHORS = {
@@ -8,6 +8,19 @@ IMGT_ANCHORS = {
     'CDR2': {'start': 55, 'end': 66},
     'CDR3': {'start': 104, 'end': 118}
 }
+def write_renumbered_fv(out_folder, in_path):
+    """
+    Uses your ANARCII renumbering to produce an IMGT-numbered FV PDB.
+    Mirrors your existing helper signature/behavior.
+    """
+    outputs=process_pdb(
+        input_pdb=in_path,
+        out_prefix=out_folder,
+        write_fv= True
+        )
+    full_imgt=outputs["pairs"]["files"]["full"]
+    variable_pdb_imgt=outputs["pairs"]["files"]["variable"]
+    return full_imgt,variable_pdb_imgt
 
 def get_tcr_cdr_anchor_coords(pdb_file: str) -> dict:
     """
@@ -82,9 +95,11 @@ def format_residue(residue: Residue) -> str:
     return f"{res_name} {res_id[1]}{res_id[2].strip()}"
 
 def run(pdb_file):
-    write_renumbered_fv(pdb_file.replace(".pdb", "_imgt.pdb"), pdb_file, fv_only=True)
-    tcr_anchors = get_tcr_cdr_anchor_coords(pdb_file.replace(".pdb", "_imgt.pdb"))
-    os.remove(pdb_file.replace(".pdb", "_imgt.pdb"))  # Clean up the temporary file
+    out_folder = os.path.dirname(pdb_file)
+    renumbered_pdb, renumbered_pdb_fv=write_renumbered_fv(out_folder, pdb_file)
+    tcr_anchors = get_tcr_cdr_anchor_coords(renumbered_pdb)
+    os.remove(renumbered_pdb)
+    os.remove(renumbered_pdb_fv)  # Clean up the temporary file
     return tcr_anchors
 
 if __name__ == '__main__':

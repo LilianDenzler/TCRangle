@@ -7,7 +7,7 @@ import json
 import tempfile
 import biotite.structure as bts
 import biotite.structure.io as btsio
-from trangle.anarci_numbering import variable_renumber
+from trangle.numbering import process_pdb
 # Suppress PDB parsing warnings for cleaner output
 warnings.filterwarnings("ignore", ".*is discontinuous.*")
 #get folder of current file
@@ -17,10 +17,15 @@ out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 
 def write_renumbered_fv(out_path, in_path):
-    imgt_pdb = os.path.join(out_path)
-    variable_pdb_imgt = os.path.join(out_path.replace(".pdb", "_fv.pdb"))
-    A_chain, B_chain, imgt_path=variable_renumber(in_path, imgt_pdb, variable_pdb_imgt)
-    return out_path
+
+    outputs=process_pdb(
+        input_pdb=in_path,
+        out_prefix=out_path,
+        write_fv= True
+        )
+    full_imgt=outputs["pairs"]["files"]["full"]
+    variable_pdb_imgt=outputs["pairs"]["files"]["variable"]
+    return out_path,variable_pdb_imgt
 
 # ========================
 # Geometry and Math Helpers
@@ -279,9 +284,7 @@ def run(input_pdb, out_path, BA, BC1, BC2, AC1, AC2, dc, data_path=data_path):
     tmp_out = out_dir / pdb_name; tmp_out.mkdir(exist_ok=True)
     vis_folder = tmp_out / "vis"; vis_folder.mkdir(exist_ok=True)
 
-    renumbered_pdb = str(tmp_out / f"{pdb_name}_imgt.pdb")
-    renumbered_pdb_fv =str(tmp_out / f"{pdb_name}_imgt_fv.pdb")
-    write_renumbered_fv(renumbered_pdb, input_pdb)
+    renumbered_pdb_fv=write_renumbered_fv(tmp_out, input_pdb)
 
     # 1. Build the target geometry from the input angles
     A_C, A_V1, A_V2, B_C, B_V1, B_V2 = build_geometry_from_angles(BA, BC1, BC2, AC1, AC2, dc)

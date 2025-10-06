@@ -8,7 +8,7 @@ import warnings
 from anarci import number
 from Bio.SeqUtils import seq1
 from pathlib import Path
-from trangle.anarci_numbering import variable_renumber
+from trangle.numbering import process_pdb
 # Suppress PDB parsing warnings for cleaner output
 warnings.filterwarnings("ignore", ".*is discontinuous.*")
 
@@ -33,13 +33,15 @@ ranges_imgt = {
     "BCDR3": [105,117]
     }
 
-
-
 def imgt_numbering(pdb_file_path, output_dir="."):
-    imgt_pdb = os.path.join(output_dir, "imgt_numbered.pdb")
-    variable_pdb_imgt = os.path.join(output_dir, "variable_imgt.pdb")
-    A_chain, B_chain, imgt_path=variable_renumber(pdb_file_path, imgt_pdb, variable_pdb_imgt)
-    return imgt_path, variable_pdb_imgt
+    outputs=process_pdb(
+        input_pdb=pdb_file_path,
+        out_prefix=output_dir,
+        write_fv= True
+        )
+    full_imgt=outputs["pairs"]["files"]["full"]
+    variable_pdb_imgt=outputs["pairs"]["files"]["variable"]
+    return full_imgt, variable_pdb_imgt
 
 def determine_consensus_atoms(stats_df, ranges_imgt):
     #get residue numbers with mean rmsd < 2.0 and stddev < 2.0

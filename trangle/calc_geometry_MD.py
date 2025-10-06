@@ -29,8 +29,7 @@ def run(input_pdb, input_md, out_path, data_path=data_path, vis=False):
     vis_folder = tmp_out / "vis"
     if vis:
         vis_folder.mkdir(exist_ok=True)
-    imgt_path = str(tmp_out / f"{pdb_name}_imgt.pdb")
-    imgt_path, fv_input=write_renumbered_fv(imgt_path, input_pdb)
+    imgt_path, fv_input=write_renumbered_fv(tmp_out, input_pdb)
     input_pdb=imgt_path
     # MDAnalysis Universe
     u = mda.Universe(str(input_pdb), str(input_md))

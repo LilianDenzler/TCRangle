@@ -15,7 +15,7 @@ import biotite.structure as bts
 import biotite.structure.io as btsio
 
 # Your ANARCI-based renumbering (pass-through to your function)
-from trangle.anarci_numbering import variable_renumber
+from trangle.numbering import process_pdb
 
 warnings.filterwarnings("ignore", ".*is discontinuous.*")
 Trangle_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,15 +24,19 @@ out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 
 
-def write_renumbered_fv(out_path, in_path):
+def write_renumbered_fv(out_folder, in_path):
     """
     Uses your ANARCI renumbering to produce an IMGT-numbered FV PDB.
     Mirrors your existing helper signature/behavior.
     """
-    imgt_pdb = os.path.join(out_path)
-    variable_pdb_imgt = os.path.join(out_path.replace(".pdb", "_fv.pdb"))
-    A_chain, B_chain, imgt_path = variable_renumber(in_path, imgt_pdb, variable_pdb_imgt)
-    return out_path, variable_pdb_imgt
+    outputs=process_pdb(
+        input_pdb=in_path,
+        out_prefix=out_folder,
+        write_fv= True
+        )
+    full_imgt=outputs["pairs"]["files"]["full"]
+    variable_pdb_imgt=outputs["pairs"]["files"]["variable"]
+    return full_imgt,variable_pdb_imgt
 
 # -------------------------
 # Geometry helpers
@@ -383,8 +387,7 @@ def run(input_pdb, out_path, data_path, vis=True):
         vis_folder.mkdir(exist_ok=True)
 
     # Renumber to FV (keeps your pipeline consistent)
-    out_path = str(tmp_out / f"{pdb_name}_imgt.pdb")
-    out_path, fv_input=write_renumbered_fv(out_path, input_pdb)
+    out_path, fv_input=write_renumbered_fv(tmp_out, input_pdb)
 
     # Process (align + compute angles + visualize)
     result = process(
